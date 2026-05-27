@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 MAVEN Companion App
 Run: python3 app.py
@@ -6,6 +5,7 @@ Then open http://localhost:8080 on your phone or browser.
 
 Runs on a local machine separate from the Pi.
 The Pi runs camera_server.py on port 8081.
+The Pi runs microphone_server.py on port 8082.
 """
 
 import asyncio, aiohttp, socket, threading, time, json
@@ -13,6 +13,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 PI_PORT    = 5000
 CAM_PORT   = 8081   # camera_server.py on the Pi
+MIC_PORT   = 8082   # microphone_server.py on the Pi
 APP_PORT   = 8080
 SCAN_EVERY = 3
 
@@ -139,9 +140,6 @@ def proxy_send(name):
         return jsonify({"ok": False, "error": str(e)}), 502
 
 # ── Camera proxy ──────────────────────────────────────────────────────────────
-# The browser can't directly reach the Pi's camera on port 8081 if on a
-# different subnet or if CORS blocks it. These routes proxy through this server.
-
 @app.route("/proxy/camera/status")
 def proxy_camera_status():
     ip = request.args.get("ip")
@@ -172,11 +170,6 @@ def proxy_camera_frame():
 
 @app.route("/proxy/camera/video")
 def proxy_camera_video():
-    """
-    Proxies the MJPEG stream from the Pi's camera_server.
-    The browser hits this endpoint; this server forwards frames from the Pi.
-    This avoids any cross-origin or port issues on the client side.
-    """
     ip = request.args.get("ip")
 
     def generate():
@@ -193,7 +186,6 @@ def proxy_camera_video():
             return
 
     try:
-        # Quick reachability check before opening stream
         req.get(f"http://{ip}:{CAM_PORT}/status", timeout=2)
     except Exception:
         return "Camera not reachable", 502
@@ -202,6 +194,25 @@ def proxy_camera_video():
         generate(),
         mimetype="multipart/x-mixed-replace; boundary=frame"
     )
+
+# ── Microphone proxy ──────────────────────────────────────────────────────────
+@app.route("/proxy/mic/status")
+def proxy_mic_status():
+    ip = request.args.get("ip")
+    try:
+        r = req.get(f"http://{ip}:{MIC_PORT}/status", timeout=3)
+        return (r.text, r.status_code, {"Content-Type": "application/json"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+@app.route("/proxy/mic/level")
+def proxy_mic_level():
+    ip = request.args.get("ip")
+    try:
+        r = req.get(f"http://{ip}:{MIC_PORT}/level", timeout=2)
+        return (r.text, r.status_code, {"Content-Type": "application/json"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
 
 @app.route("/")
 def index():
@@ -300,6 +311,12 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
 .prog-count span{color:var(--green)}
 .track{height:3px;background:var(--bg3);border-radius:99px;overflow:hidden}
 .fill{height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--green));transition:width 0.7s cubic-bezier(0.4,0,0.2,1);width:0%}
+
+/* ── TAB BAR ── */
+.tab-bar{display:flex;background:var(--bg1);border-bottom:1px solid var(--border);flex-shrink:0}
+.tab-btn{flex:1;padding:10px 0 9px;background:none;border:none;border-bottom:2px solid transparent;color:var(--text3);font-family:'DM Sans',sans-serif;font-size:13px;font-weight:500;letter-spacing:0.04em;cursor:pointer;transition:color 0.15s,border-color 0.15s}
+.tab-btn.active{color:var(--accent);border-bottom-color:var(--accent)}
+
 .cmd-scroll{flex:1;overflow-y:auto;padding:10px 14px calc(20px + var(--safe-b));-webkit-overflow-scrolling:touch}
 .group-head{font-size:10px;font-weight:500;letter-spacing:1.5px;text-transform:uppercase;color:var(--text3);padding:16px 4px 8px;font-family:'DM Mono',monospace}
 .cmd-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);margin-bottom:8px;overflow:hidden;transition:border-color 0.2s,transform 0.1s;cursor:pointer}
@@ -320,6 +337,23 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
 .cmd-card.learned .cmd-state{color:var(--green)}
 .cmd-card.learning-active .cmd-state{color:var(--accent)}
 .cmd-chev{color:var(--text3);font-size:18px;flex-shrink:0}
+
+/* ── SENSORS PANEL ── */
+#sensors-panel{flex:1;overflow-y:auto;padding:4px 14px calc(20px + var(--safe-b));-webkit-overflow-scrolling:touch}
+.sens-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;margin-bottom:10px}
+.sens-cam-feed{position:relative;aspect-ratio:16/9;background:#080a0d;display:flex;align-items:center;justify-content:center}
+.sens-cam-feed img{width:100%;height:100%;object-fit:cover;display:none}
+.sens-cam-footer{padding:10px 14px;display:flex;justify-content:space-between;align-items:center}
+.sens-mic-body{padding:14px}
+.sens-mic-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.sens-stats-row{display:flex;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)}
+.sens-stat{flex:1;text-align:center}
+.sens-stat-val{font-size:12px;font-weight:500;color:var(--accent);font-family:'DM Mono',monospace}
+.sens-stat-key{font-size:10px;color:var(--text3);margin-top:2px}
+.meter-wrap{height:5px;background:var(--bg3);border-radius:99px;overflow:hidden;margin-bottom:8px}
+.meter-bar{height:100%;border-radius:99px;background:linear-gradient(90deg,var(--green),#00e5ff);transition:width 0.1s}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--text3);flex-shrink:0}
+.dot.ok{background:var(--green);animation:conn-pulse 2s infinite}
 
 /* ── CAMERA SCREEN ── */
 #screen-camera{background:var(--bg)}
@@ -382,6 +416,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 .spinner{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,0.25);border-top-color:#fff;border-radius:50%;animation:spin 0.6s linear infinite;vertical-align:middle;margin-right:6px}
 @keyframes spin{to{transform:rotate(360deg)}}
+.mono{font-family:'DM Mono',monospace;font-size:11px;color:var(--text3)}
 </style>
 </head>
 <body>
@@ -414,20 +449,61 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
       <div class="status-name" id="device-name-display" onclick="openRename()">My MAVEN</div>
       <div class="status-conn">Connected</div>
     </div>
-    <!-- Camera button -->
-    <button class="btn-icon" onclick="openCamera()" title="Camera view">
-      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
-    </button>
     <button class="btn-disconnect" onclick="disconnect()">Disconnect</button>
   </div>
-  <div class="progress-wrap">
+
+  <!-- Tab bar -->
+  <div class="tab-bar">
+    <button class="tab-btn active" id="tab-commands" onclick="switchTab('commands')">Commands</button>
+    <button class="tab-btn" id="tab-sensors" onclick="switchTab('sensors')">Sensors</button>
+  </div>
+
+  <div class="progress-wrap" id="progress-wrap">
     <div class="prog-row">
       <span class="prog-label">Commands learned</span>
       <span class="prog-count"><span id="prog-num">0</span> / 13</span>
     </div>
     <div class="track"><div class="fill" id="prog-fill"></div></div>
   </div>
+
   <div class="cmd-scroll" id="cmd-scroll"></div>
+
+  <!-- Sensors panel -->
+  <div id="sensors-panel" style="display:none">
+
+    <div class="group-head">Camera</div>
+    <div class="sens-card">
+      <div class="sens-cam-feed" id="sens-cam-feed">
+        <img id="sens-cam-img" alt="camera">
+        <div class="live-badge" id="sens-live-badge"><div class="live-dot"></div>LIVE</div>
+        <span id="sens-cam-placeholder" style="font-size:13px;color:var(--text3)">Connecting…</span>
+      </div>
+      <div class="sens-cam-footer">
+        <span class="mono" id="sens-cam-stat">—</span>
+        <span class="mono" id="sens-cam-status" style="color:var(--text3)">—</span>
+      </div>
+    </div>
+
+    <div class="group-head">Microphone</div>
+    <div class="sens-card">
+      <div class="sens-mic-body">
+        <div class="sens-mic-row">
+          <div class="dot" id="sens-mic-dot"></div>
+          <span style="font-size:13px;font-weight:500;flex:1" id="sens-mic-label">Connecting…</span>
+          <span class="mono" id="sens-rms-pct">—</span>
+        </div>
+        <div class="meter-wrap"><div class="meter-bar" id="sens-meter-bar" style="width:0%"></div></div>
+        <canvas id="sens-wave" style="width:100%;height:44px;display:block;border-radius:6px;background:#080a0d"></canvas>
+        <div class="sens-stats-row">
+          <div class="sens-stat"><div class="sens-stat-val" id="sens-sr">—</div><div class="sens-stat-key">Hz</div></div>
+          <div class="sens-stat"><div class="sens-stat-val" id="sens-bits">—</div><div class="sens-stat-key">bit</div></div>
+          <div class="sens-stat"><div class="sens-stat-val" id="sens-buf">—</div><div class="sens-stat-key">buffer</div></div>
+          <div class="sens-stat"><div class="sens-stat-val" id="sens-chunks">—</div><div class="sens-stat-key">chunks</div></div>
+        </div>
+      </div>
+    </div>
+
+  </div>
 </div>
 
 <!-- CAMERA SCREEN -->
@@ -509,7 +585,14 @@ let codes=[], activeSheet=null, learningFor=null, pollTimer=null, scanTimer=null
 // ── Camera state ──────────────────────────────────────────────────────────────
 let cameraActive    = false;
 let stillPollTimer  = null;
-let cameraMode      = null; // "mjpeg" | "poll" | "error"
+let cameraMode      = null;
+
+// ── Sensors state ─────────────────────────────────────────────────────────────
+let sensorsActive     = false;
+let sensMicTimer      = null;
+let sensCamStillTimer = null;
+let sensMicStatDone   = false;
+const sensRmsHistory  = new Array(80).fill(0);
 
 applyName();
 if (piIP && mavenToken) silentReconnect(); else startScanning();
@@ -628,7 +711,7 @@ async function connectTo(ip, cardEl) {
 }
 
 function enterHome(){showScreen("screen-home");applyName();fetchCodes();clearInterval(pollTimer);pollTimer=setInterval(()=>fetchCodes(true),3000)}
-function disconnect(){clearInterval(pollTimer);stopCameraFeed();closeSheet();mavenToken="";localStorage.removeItem("maven_token");startScanning()}
+function disconnect(){clearInterval(pollTimer);stopSensors();stopCameraFeed();closeSheet();mavenToken="";localStorage.removeItem("maven_token");startScanning()}
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 async function fetchCodes(silent=false){
@@ -712,7 +795,129 @@ function openRename(){document.getElementById("rename-input").value=deviceName;d
 function closeRename(e){if(e&&e.target!==document.getElementById("rename-overlay"))return;document.getElementById("rename-overlay").classList.remove("open")}
 function saveRename(){const v=document.getElementById("rename-input").value.trim();if(v){deviceName=v;localStorage.setItem(`maven_name_${piIP}`,v);localStorage.setItem("maven_name",v);applyName()}document.getElementById("rename-overlay").classList.remove("open");toast("Name saved")}
 
-// ── Camera ────────────────────────────────────────────────────────────────────
+// ── Tab switching ─────────────────────────────────────────────────────────────
+function switchTab(tab) {
+  const isCmd = tab === 'commands';
+  document.getElementById('cmd-scroll').style.display       = isCmd ? '' : 'none';
+  document.getElementById('sensors-panel').style.display    = isCmd ? 'none' : '';
+  document.getElementById('progress-wrap').style.display    = isCmd ? '' : 'none';
+  document.getElementById('tab-commands').classList.toggle('active', isCmd);
+  document.getElementById('tab-sensors').classList.toggle('active', !isCmd);
+  if (!isCmd) startSensors(); else stopSensors();
+}
+
+// ── Sensors ───────────────────────────────────────────────────────────────────
+function startSensors() {
+  sensorsActive = true;
+  sensMicStatDone = false;
+  pollSensMic();
+  pollSensMicStatus();
+  pollSensCamStatus();
+  startSensCamFeed();
+}
+
+function stopSensors() {
+  sensorsActive = false;
+  clearTimeout(sensMicTimer);
+  clearTimeout(sensCamStillTimer);
+  const img = document.getElementById('sens-cam-img');
+  if (img) { img.onload = null; img.src = ''; img.style.display = 'none'; }
+  const badge = document.getElementById('sens-live-badge');
+  if (badge) badge.classList.remove('visible');
+}
+
+function startSensCamFeed() {
+  const img = document.getElementById('sens-cam-img');
+  const ph  = document.getElementById('sens-cam-placeholder');
+  if (!img) return;
+
+  function grabFrame() {
+    if (!sensorsActive) return;
+    const tmp = new Image();
+    tmp.onload = () => {
+      if (!sensorsActive) return;
+      img.src = tmp.src;
+      img.style.display = 'block';
+      if (ph) ph.style.display = 'none';
+      const badge = document.getElementById('sens-live-badge');
+      if (badge) badge.classList.add('visible');
+      sensCamStillTimer = setTimeout(grabFrame, 250);
+    };
+    tmp.onerror = () => {
+      if (!sensorsActive) return;
+      sensCamStillTimer = setTimeout(grabFrame, 2000);
+    };
+    tmp.src = `/proxy/camera/frame.jpg?ip=${piIP}&t=${Date.now()}`;
+  }
+  grabFrame();
+}
+
+async function pollSensCamStatus() {
+  if (!sensorsActive) return;
+  try {
+    const r = await fetch(`/proxy/camera/status?ip=${piIP}`);
+    const d = await r.json();
+    const stat = document.getElementById('sens-cam-stat');
+    const ok   = document.getElementById('sens-cam-status');
+    if (stat) stat.textContent = d.ok ? `${d.width}×${d.height} · ${d.fps_limit} fps` : '—';
+    if (ok)   { ok.textContent = d.ok ? '● active' : '○ offline'; ok.style.color = d.ok ? 'var(--green)' : 'var(--text3)'; }
+  } catch(e) {}
+  if (sensorsActive) setTimeout(pollSensCamStatus, 5000);
+}
+
+async function pollSensMic() {
+  if (!sensorsActive) return;
+  try {
+    const r = await fetch(`/proxy/mic/level?ip=${piIP}`);
+    const d = await r.json();
+    const pct = d.rms_pct.toFixed(1);
+    document.getElementById('sens-rms-pct').textContent  = pct + '%';
+    document.getElementById('sens-meter-bar').style.width = Math.min(d.rms_pct, 100) + '%';
+    const dot = document.getElementById('sens-mic-dot');
+    const lbl = document.getElementById('sens-mic-label');
+    if (dot) dot.className = 'dot' + (d.ok ? ' ok' : '');
+    if (lbl) lbl.textContent = d.ok ? 'Microphone active' : 'Microphone not found';
+    sensRmsHistory.shift();
+    sensRmsHistory.push(d.rms);
+    drawSensWave();
+  } catch(e) {}
+  if (sensorsActive) sensMicTimer = setTimeout(pollSensMic, 120);
+}
+
+async function pollSensMicStatus() {
+  if (!sensorsActive) return;
+  try {
+    const r = await fetch(`/proxy/mic/status?ip=${piIP}`);
+    const d = await r.json();
+    const sr = document.getElementById('sens-sr');
+    const bits = document.getElementById('sens-bits');
+    const buf  = document.getElementById('sens-buf');
+    const chk  = document.getElementById('sens-chunks');
+    if (sr)   sr.textContent   = d.sample_rate ? (d.sample_rate/1000).toFixed(0)+'k' : '—';
+    if (bits) bits.textContent = d.bit_depth || '—';
+    if (buf)  buf.textContent  = d.buffer_seconds ? d.buffer_seconds+'s' : '—';
+    if (chk)  chk.textContent  = d.chunks_stored ?? '—';
+  } catch(e) {}
+  if (sensorsActive) setTimeout(pollSensMicStatus, 3000);
+}
+
+function drawSensWave() {
+  const canvas = document.getElementById('sens-wave');
+  if (!canvas) return;
+  const W = canvas.offsetWidth, H = 44;
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+  const bw = W / sensRmsHistory.length;
+  sensRmsHistory.forEach((v, i) => {
+    const b = Math.pow(v, 0.5);
+    const h = Math.max(2, b * H * 0.92);
+    ctx.fillStyle = `rgba(0,229,160,${0.2 + b * 0.8})`;
+    ctx.fillRect(i * bw, (H - h) / 2, Math.max(1, bw - 1), h);
+  });
+}
+
+// ── Camera (full screen) ──────────────────────────────────────────────────────
 function openCamera() {
   showScreen("screen-camera");
   startCameraFeed();
@@ -727,7 +932,6 @@ function setCameraConnLabel(text, live=false) {
   const el = document.getElementById("camera-conn-label");
   if (!el) return;
   el.textContent = text;
-  // Reuse .status-conn green dot; override color for error state
   el.style.color = live ? "" : "var(--text3)";
 }
 
@@ -744,7 +948,6 @@ function showCameraFeed(imgEl, placeholderEl) {
 }
 
 function showCameraError(title, msg) {
-  const card = document.getElementById("camera-card");
   const feedWrap = document.getElementById("camera-feed-wrap");
   feedWrap.innerHTML = `
     <div class="camera-err">
@@ -758,7 +961,6 @@ function showCameraError(title, msg) {
 }
 
 function retryCameraFeed() {
-  // Rebuild the feed wrap markup then retry
   const feedWrap = document.getElementById("camera-feed-wrap");
   feedWrap.innerHTML = `
     <img id="camera-img" alt="MAVEN camera feed">
@@ -784,12 +986,10 @@ async function startCameraFeed() {
 
   setCameraConnLabel("Connecting…");
 
-  // All camera routes go through our Flask proxy, so no cross-origin issues.
   const statusUrl = `/proxy/camera/status?ip=${piIP}`;
   const streamUrl = `/proxy/camera/video?ip=${piIP}`;
   const frameUrl  = `/proxy/camera/frame.jpg?ip=${piIP}`;
 
-  // 1. Check if camera_server is reachable and camera is OK
   let camOk = false;
   let camErr = "Camera not reachable — make sure camera_server.py is running on the Pi.";
   try {
@@ -803,7 +1003,7 @@ async function startCameraFeed() {
     camOk = false;
   }
 
-  if (!cameraActive) return; // user already navigated away
+  if (!cameraActive) return;
 
   if (!camOk) {
     showCameraError("Camera unavailable", camErr);
@@ -812,13 +1012,9 @@ async function startCameraFeed() {
 
   if (statusMsg) statusMsg.textContent = "Starting stream…";
 
-  // 2. Try MJPEG stream first — works on desktop & Android Chrome.
-  //    iOS Safari silently refuses MJPEG in <img>; we detect that via a
-  //    timeout: if the first frame doesn't arrive in 3s, fall back to polling.
   let mjpegResolved = false;
   const mjpegTimeout = setTimeout(() => {
     if (!mjpegResolved && cameraActive) {
-      // MJPEG didn't fire onload — assume iOS/unsupported; switch to polling
       img.src = "";
       img.style.display = "none";
       pollStills(frameUrl, img, placeholder);
@@ -839,7 +1035,6 @@ async function startCameraFeed() {
     clearTimeout(mjpegTimeout);
     img.src = "";
     img.style.display = "none";
-    // Fall back to still polling
     pollStills(frameUrl, img, placeholder);
   };
 
@@ -849,7 +1044,6 @@ async function startCameraFeed() {
 function pollStills(frameUrl, imgEl, placeholderEl) {
   if (!cameraActive) return;
   cameraMode = "poll";
-
   let firstFrame = true;
 
   function grab() {
@@ -858,22 +1052,15 @@ function pollStills(frameUrl, imgEl, placeholderEl) {
     tmp.onload = () => {
       if (!cameraActive) return;
       imgEl.src = tmp.src;
-      if (firstFrame) {
-        firstFrame = false;
-        showCameraFeed(imgEl, placeholderEl);
-      }
-      // ~10 fps via polling
+      if (firstFrame) { firstFrame = false; showCameraFeed(imgEl, placeholderEl); }
       stillPollTimer = setTimeout(grab, 100);
     };
     tmp.onerror = () => {
       if (!cameraActive) return;
-      // Camera may have hiccuped — retry slower
       stillPollTimer = setTimeout(grab, 1000);
     };
-    // Cache-bust so the browser doesn't serve a stale frame
     tmp.src = `${frameUrl}&t=${Date.now()}`;
   }
-
   grab();
 }
 
