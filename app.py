@@ -1090,29 +1090,23 @@ function stopCameraFeed() {
 </body>
 </html>"""
 
-# if __name__ == "__main__":
-#     try:
-#         import requests
-#     except ImportError:
-#         import subprocess, sys
-#         subprocess.check_call([sys.executable,"-m","pip","install","requests","-q"])
-#         import requests
-#     try:
-#         import aiohttp
-#     except ImportError:
-#         import subprocess, sys
-#         subprocess.check_call([sys.executable,"-m","pip","install","aiohttp","-q"])
-#         import aiohttp
-
-#     t = threading.Thread(target=scanner_thread, daemon=True)
-#     t.start()
-#     print("\n=== MAVEN Companion ===")
-#     print(f"Open in browser:  http://localhost:{APP_PORT}")
-#     print(f"Or on your phone: http://<this-computer-IP>:{APP_PORT}\n")
-#     app.run(host="0.0.0.0", port=APP_PORT, debug=False)
-
 if __name__ == "__main__":
-    import os
+    try:
+        import requests
+    except ImportError:
+        import subprocess, sys
+        subprocess.check_call([sys.executable,"-m","pip","install","requests","-q"])
+        import requests
+    try:
+        import aiohttp
+    except ImportError:
+        import subprocess, sys
+        subprocess.check_call([sys.executable,"-m","pip","install","aiohttp","-q"])
+        import aiohttp
+
     t = threading.Thread(target=scanner_thread, daemon=True)
     t.start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    print("\n=== MAVEN Companion ===")
+    print(f"Open in browser:  http://localhost:{APP_PORT}")
+    print(f"Or on your phone: http://<this-computer-IP>:{APP_PORT}\n")
+    app.run(host="0.0.0.0", port=APP_PORT, debug=False)
