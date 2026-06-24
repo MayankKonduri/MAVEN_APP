@@ -88,6 +88,7 @@ def scanner_thread():
                 for ip in list(devices):
                     if now - devices[ip]["seen"] > SCAN_EVERY * 2.5:
                         del devices[ip]
+            rebind_paired_ip_if_needed(found)
         except Exception as e:
             with lock:
                 scanner_state["last_scan_at"] = now
@@ -164,6 +165,90 @@ def api_devices():
 # proxy all Pi API calls so the browser never touches the Pi directly
 import requests as req
 
+paired_session = None
+paired_lock = threading.Lock()
+TOKEN_VERIFY_TIMEOUT = 1.0
+
+def get_paired_session():
+    with paired_lock:
+        return dict(paired_session) if paired_session else None
+
+def set_paired_session(token, ip, name="MAVEN"):
+    global paired_session
+    with paired_lock:
+        paired_session = {
+            "token": token,
+            "ip": ip,
+            "name": name,
+            "paired_at": time.time(),
+        }
+
+def clear_paired_session():
+    global paired_session
+    with paired_lock:
+        paired_session = None
+
+def verify_device_token(token, ip, timeout=TOKEN_VERIFY_TIMEOUT):
+    if not token or not ip:
+        return False
+    try:
+        r = req.get(
+            f"http://{ip}:{PI_PORT}/api/codes",
+            headers={"X-Maven-Token": token},
+            timeout=timeout,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def rebind_paired_ip_if_needed(found_devices):
+    session = get_paired_session()
+    if not session:
+        return
+
+    token = session["token"]
+    current_ip = session["ip"]
+    if verify_device_token(token, current_ip):
+        return
+
+    candidate_ips = [ip for ip, _ in found_devices]
+    if current_ip not in candidate_ips:
+        candidate_ips.insert(0, current_ip)
+
+    for ip in candidate_ips:
+        if ip == current_ip:
+            continue
+        if verify_device_token(token, ip):
+            with paired_lock:
+                if paired_session and paired_session["token"] == token:
+                    old_ip = paired_session["ip"]
+                    paired_session["ip"] = ip
+            log_event(
+                "info",
+                "paired_ip_rebound",
+                old_ip=old_ip,
+                new_ip=ip,
+            )
+            return
+
+def resolve_proxy_ip(*, allow_unpaired=False):
+    token = request.headers.get("X-Maven-Token", "")
+    session = get_paired_session()
+
+    if session:
+        if token and token != session["token"]:
+            return None, (jsonify({"ok": False, "error": "invalid session token"}), 403)
+        return session["ip"], None
+
+    if allow_unpaired:
+        payload = request.get_json(silent=True) or {}
+        ip = request.args.get("ip") or payload.get("ip")
+        if ip:
+            return ip, None
+        return None, (jsonify({"ok": False, "error": "missing device ip"}), 400)
+
+    return None, (jsonify({"ok": False, "error": "no paired device"}), 503)
+
 HEALTH_TIMEOUT_SECONDS = 1.0
 
 def check_http_service(name, url, timeout=HEALTH_TIMEOUT_SECONDS):
@@ -204,6 +289,10 @@ def select_health_target_ip():
     requested_ip = request.args.get("ip")
     if requested_ip:
         return requested_ip
+
+    session = get_paired_session()
+    if session:
+        return session["ip"]
 
     with lock:
         if not devices:
@@ -276,29 +365,89 @@ def health():
     report = build_health_report()
     return jsonify(report), 503 if report["status"] == "unhealthy" else 200
 
+@app.route("/api/paired")
+def api_paired():
+    token = request.headers.get("X-Maven-Token", "")
+    if not token:
+        return jsonify({"ok": False, "error": "missing token"}), 401
+
+    session = get_paired_session()
+    if session and token == session["token"]:
+        return jsonify({
+            "ok": True,
+            "ip": session["ip"],
+            "name": session.get("name", "MAVEN"),
+        })
+
+    hint_ip = request.args.get("ip")
+    if hint_ip and verify_device_token(token, hint_ip):
+        with lock:
+            name = devices.get(hint_ip, {}).get("name", "MAVEN")
+        set_paired_session(token, hint_ip, name)
+        return jsonify({"ok": True, "ip": hint_ip, "name": name})
+
+    with lock:
+        candidate_ips = list(devices.keys())
+
+    for ip in candidate_ips:
+        if verify_device_token(token, ip):
+            with lock:
+                name = devices.get(ip, {}).get("name", "MAVEN")
+            set_paired_session(token, ip, name)
+            log_event("info", "paired_session_restored", ip=ip)
+            return jsonify({"ok": True, "ip": ip, "name": name})
+
+    return jsonify({"ok": False, "error": "not paired"}), 404
+
+@app.route("/api/disconnect", methods=["POST"])
+def api_disconnect():
+    token = request.headers.get("X-Maven-Token", "")
+    session = get_paired_session()
+    if session and token and token != session["token"]:
+        return jsonify({"ok": False, "error": "invalid session token"}), 403
+    clear_paired_session()
+    return jsonify({"ok": True})
+
 @app.route("/proxy/confirm-pair", methods=["POST"])
 def proxy_pair():
-    ip = request.json.get("ip")
+    ip, err = resolve_proxy_ip(allow_unpaired=True)
+    if err:
+        return err
     try:
         r = req.post(f"http://{ip}:{PI_PORT}/api/confirm-pair", timeout=6)
-        return jsonify(r.json())
+        body = r.json()
+        if body.get("ok") and body.get("token"):
+            with lock:
+                name = devices.get(ip, {}).get("name", "MAVEN")
+            set_paired_session(body["token"], ip, name)
+        return jsonify(body)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
 
 @app.route("/proxy/codes")
 def proxy_codes():
-    ip    = request.args.get("ip")
+    ip, err = resolve_proxy_ip(allow_unpaired=True)
+    if err:
+        return err
     token = request.headers.get("X-Maven-Token", "")
     try:
         r = req.get(f"http://{ip}:{PI_PORT}/api/codes",
                     headers={"X-Maven-Token": token}, timeout=5)
+        if r.status_code == 200 and token:
+            session = get_paired_session()
+            if not session or session["token"] != token:
+                with lock:
+                    name = devices.get(ip, {}).get("name", "MAVEN")
+                set_paired_session(token, ip, name)
         return (r.text, r.status_code, {"Content-Type": "application/json"})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
 @app.route("/proxy/learn/<name>", methods=["POST"])
 def proxy_learn(name):
-    ip    = request.args.get("ip")
+    ip, err = resolve_proxy_ip()
+    if err:
+        return err
     token = request.headers.get("X-Maven-Token", "")
     try:
         r = req.post(f"http://{ip}:{PI_PORT}/api/learn/{name}",
@@ -309,7 +458,9 @@ def proxy_learn(name):
 
 @app.route("/proxy/clear/<name>", methods=["POST"])
 def proxy_clear(name):
-    ip    = request.args.get("ip")
+    ip, err = resolve_proxy_ip()
+    if err:
+        return err
     token = request.headers.get("X-Maven-Token", "")
     try:
         r = req.post(f"http://{ip}:{PI_PORT}/api/clear/{name}",
@@ -320,7 +471,9 @@ def proxy_clear(name):
 
 @app.route("/proxy/send/<name>", methods=["POST"])
 def proxy_send(name):
-    ip    = request.args.get("ip")
+    ip, err = resolve_proxy_ip()
+    if err:
+        return err
     token = request.headers.get("X-Maven-Token", "")
     try:
         r = req.post(f"http://{ip}:{PI_PORT}/api/send/{name}",
@@ -332,7 +485,9 @@ def proxy_send(name):
 # ── Camera proxy ──────────────────────────────────────────────────────────────
 @app.route("/proxy/camera/status")
 def proxy_camera_status():
-    ip = request.args.get("ip")
+    ip, err = resolve_proxy_ip()
+    if err:
+        return err
     try:
         r = req.get(f"http://{ip}:{CAM_PORT}/status", timeout=3)
         return (r.text, r.status_code, {"Content-Type": "application/json"})
@@ -341,7 +496,9 @@ def proxy_camera_status():
 
 @app.route("/proxy/camera/frame.jpg")
 def proxy_camera_frame():
-    ip = request.args.get("ip")
+    ip, err = resolve_proxy_ip()
+    if err:
+        return err
     try:
         r = req.get(f"http://{ip}:{CAM_PORT}/frame.jpg", timeout=3, stream=True)
         if r.status_code != 200:
@@ -360,7 +517,9 @@ def proxy_camera_frame():
 
 @app.route("/proxy/camera/video")
 def proxy_camera_video():
-    ip = request.args.get("ip")
+    ip, err = resolve_proxy_ip()
+    if err:
+        return err
 
     def generate():
         try:
@@ -388,7 +547,9 @@ def proxy_camera_video():
 # ── Microphone proxy ──────────────────────────────────────────────────────────
 @app.route("/proxy/mic/status")
 def proxy_mic_status():
-    ip = request.args.get("ip")
+    ip, err = resolve_proxy_ip()
+    if err:
+        return err
     try:
         r = req.get(f"http://{ip}:{MIC_PORT}/status", timeout=3)
         return (r.text, r.status_code, {"Content-Type": "application/json"})
@@ -397,7 +558,9 @@ def proxy_mic_status():
 
 @app.route("/proxy/mic/level")
 def proxy_mic_level():
-    ip = request.args.get("ip")
+    ip, err = resolve_proxy_ip()
+    if err:
+        return err
     try:
         r = req.get(f"http://{ip}:{MIC_PORT}/level", timeout=2)
         return (r.text, r.status_code, {"Content-Type": "application/json"})
@@ -489,6 +652,12 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
 .status-name{font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
 .status-conn{font-size:11px;color:var(--green);display:flex;align-items:center;gap:5px;margin-top:3px;font-family:'DM Mono',monospace}
 .status-conn::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--green);display:inline-block;animation:conn-pulse 2s infinite}
+.status-conn.degraded{color:#ffb020}
+.status-conn.degraded::before{background:#ffb020}
+.status-conn.offline{color:var(--red);animation:none}
+.status-conn.offline::before{background:var(--red);animation:none}
+.status-conn.checking{color:var(--text3)}
+.status-conn.checking::before{background:var(--text3);animation:scan-blink 1.4s ease-in-out infinite}
 @keyframes conn-pulse{0%,100%{opacity:1}50%{opacity:0.35}}
 .btn-icon{background:none;border:1px solid var(--border2);color:var(--text2);width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;transition:all 0.15s;padding:0}
 .btn-icon:active{border-color:var(--accent);color:var(--accent)}
@@ -637,7 +806,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
     </div>
     <div class="status-info">
       <div class="status-name" id="device-name-display" onclick="openRename()">My MAVEN</div>
-      <div class="status-conn">Connected</div>
+      <div class="status-conn checking" id="status-conn">Checking…</div>
     </div>
     <button class="btn-disconnect" onclick="disconnect()">Disconnect</button>
   </div>
@@ -770,7 +939,7 @@ const GROUP_ORDER = ["Power","Volume","Channels","Navigation"];
 let piIP       = localStorage.getItem("maven_ip")    || "";
 let mavenToken = localStorage.getItem("maven_token") || "";
 let deviceName = localStorage.getItem(`maven_name_${piIP}`) || localStorage.getItem("maven_name") || "My MAVEN";
-let codes=[], activeSheet=null, learningFor=null, pollTimer=null, scanTimer=null, connecting=false;
+let codes=[], activeSheet=null, learningFor=null, pollTimer=null, scanTimer=null, connecting=false, healthTimer=null;
 
 // ── Camera state ──────────────────────────────────────────────────────────────
 let cameraActive    = false;
@@ -792,8 +961,53 @@ function api(path, opts={}) {
   const headers = {"Content-Type":"application/json"};
   if (mavenToken) headers["X-Maven-Token"] = mavenToken;
   const proxyPath = path.replace("/api/","/proxy/");
-  const sep = proxyPath.includes("?")?"&":"?";
-  return fetch(`${proxyPath}${sep}ip=${piIP}`, {...opts, headers:{...headers,...(opts.headers||{})}});
+  return fetch(proxyPath, {...opts, headers:{...headers,...(opts.headers||{})}});
+}
+
+async function syncPairedSession() {
+  if (!mavenToken) return false;
+  try {
+    const hint = piIP ? `?ip=${encodeURIComponent(piIP)}` : "";
+    const r = await fetch(`/api/paired${hint}`, {headers: {"X-Maven-Token": mavenToken}});
+    if (!r.ok) return false;
+    const d = await r.json();
+    if (!d.ok || !d.ip) return false;
+    piIP = d.ip;
+    localStorage.setItem("maven_ip", piIP);
+    return true;
+  } catch(e) { return false; }
+}
+
+function setConnectionStatus(state, label) {
+  const el = document.getElementById("status-conn");
+  if (!el) return;
+  el.className = "status-conn" + (state ? " " + state : "");
+  el.textContent = label;
+}
+
+async function pollConnectionHealth() {
+  if (!mavenToken || !document.getElementById("screen-home").classList.contains("active")) return;
+  try {
+    const r = await fetch("/health");
+    const d = await r.json();
+    if (d.status === "healthy") setConnectionStatus("", "Connected");
+    else if (d.status === "degraded") setConnectionStatus("degraded", "Connected · some sensors offline");
+    else setConnectionStatus("offline", "Device unreachable");
+  } catch(e) {
+    setConnectionStatus("offline", "Companion unreachable");
+  }
+}
+
+function startHealthPolling() {
+  clearInterval(healthTimer);
+  setConnectionStatus("checking", "Checking…");
+  pollConnectionHealth();
+  healthTimer = setInterval(pollConnectionHealth, 10000);
+}
+
+function stopHealthPolling() {
+  clearInterval(healthTimer);
+  healthTimer = null;
 }
 
 function showScreen(id) {
@@ -805,10 +1019,8 @@ function applyName(){const el=document.getElementById("device-name-display");if(
 
 // ── Reconnect / Scan ──────────────────────────────────────────────────────────
 async function silentReconnect() {
-  try {
-    const r = await fetch(`/proxy/codes?ip=${piIP}`,{headers:{"X-Maven-Token":mavenToken}});
-    if (r.ok){enterHome();return;}
-  } catch(e){}
+  if (!mavenToken) { startScanning(); return; }
+  if (await syncPairedSession()) { enterHome(); return; }
   mavenToken="";localStorage.removeItem("maven_token");startScanning();
 }
 
@@ -900,8 +1112,14 @@ async function connectTo(ip, cardEl) {
   } catch(e){toast("Connection failed — try again");connecting=false;}
 }
 
-function enterHome(){showScreen("screen-home");applyName();fetchCodes();clearInterval(pollTimer);pollTimer=setInterval(()=>fetchCodes(true),3000)}
-function disconnect(){clearInterval(pollTimer);stopSensors();stopCameraFeed();closeSheet();mavenToken="";localStorage.removeItem("maven_token");startScanning()}
+function enterHome(){showScreen("screen-home");applyName();fetchCodes();clearInterval(pollTimer);pollTimer=setInterval(()=>fetchCodes(true),3000);startHealthPolling()}
+async function disconnect(){
+  clearInterval(pollTimer);stopHealthPolling();stopSensors();stopCameraFeed();closeSheet();
+  if (mavenToken) {
+    try { await fetch("/api/disconnect", {method:"POST", headers:{"X-Maven-Token":mavenToken}}); } catch(e) {}
+  }
+  mavenToken="";localStorage.removeItem("maven_token");startScanning();
+}
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 async function fetchCodes(silent=false){
@@ -1037,7 +1255,7 @@ function startSensCamFeed() {
       if (!sensorsActive) return;
       sensCamStillTimer = setTimeout(grabFrame, 2000);
     };
-    tmp.src = `/proxy/camera/frame.jpg?ip=${piIP}&t=${Date.now()}`;
+    tmp.src = `/proxy/camera/frame.jpg?t=${Date.now()}`;
   }
   grabFrame();
 }
@@ -1045,7 +1263,7 @@ function startSensCamFeed() {
 async function pollSensCamStatus() {
   if (!sensorsActive) return;
   try {
-    const r = await fetch(`/proxy/camera/status?ip=${piIP}`);
+    const r = await fetch(`/proxy/camera/status`);
     const d = await r.json();
     const stat = document.getElementById('sens-cam-stat');
     const ok   = document.getElementById('sens-cam-status');
@@ -1058,7 +1276,7 @@ async function pollSensCamStatus() {
 async function pollSensMic() {
   if (!sensorsActive) return;
   try {
-    const r = await fetch(`/proxy/mic/level?ip=${piIP}`);
+    const r = await fetch(`/proxy/mic/level`);
     const d = await r.json();
     const pct = d.rms_pct.toFixed(1);
     document.getElementById('sens-rms-pct').textContent  = pct + '%';
@@ -1077,7 +1295,7 @@ async function pollSensMic() {
 async function pollSensMicStatus() {
   if (!sensorsActive) return;
   try {
-    const r = await fetch(`/proxy/mic/status?ip=${piIP}`);
+    const r = await fetch(`/proxy/mic/status`);
     const d = await r.json();
     const sr = document.getElementById('sens-sr');
     const bits = document.getElementById('sens-bits');
@@ -1176,9 +1394,9 @@ async function startCameraFeed() {
 
   setCameraConnLabel("Connecting…");
 
-  const statusUrl = `/proxy/camera/status?ip=${piIP}`;
-  const streamUrl = `/proxy/camera/video?ip=${piIP}`;
-  const frameUrl  = `/proxy/camera/frame.jpg?ip=${piIP}`;
+  const statusUrl = `/proxy/camera/status`;
+  const streamUrl = `/proxy/camera/video`;
+  const frameUrl  = `/proxy/camera/frame.jpg`;
 
   let camOk = false;
   let camErr = "Camera not reachable — make sure camera_server.py is running on the Pi.";

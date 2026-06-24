@@ -31,6 +31,8 @@ Flask companion app
 
 - `GET /` for the mobile-first web UI.
 - `GET /api/devices` for discovered MAVEN devices.
+- `GET /api/paired` for the server-authoritative paired device IP (supports session restore).
+- `POST /api/disconnect` to clear the in-memory paired session.
 - `GET /health` for operational health checks.
 - `/proxy/*` routes for MAVEN API, camera, and microphone requests.
 
@@ -59,7 +61,7 @@ The scanner interval is controlled by `SCAN_EVERY`, currently `3` seconds.
 
 ### Proxy API
 
-The browser uses Flask proxy routes instead of calling device services directly.
+The browser uses Flask proxy routes instead of calling device services directly. After pairing, the companion app stores the session server-side and resolves the Pi IP from that session. The browser no longer supplies a trusted target IP for paired requests.
 
 MAVEN API proxy routes:
 
@@ -91,13 +93,27 @@ The UI is embedded as an inline HTML string in `app.py`. It provides:
 
 Persistent browser state is stored in `localStorage`:
 
-- `maven_ip`
+- `maven_ip` (display and reconnect hint only; server session is authoritative after pairing)
 - `maven_token`
 - per-device display names
 
+The home screen polls `/health` every 10 seconds and shows `Connected`, `Connected · some sensors offline`, or `Device unreachable`.
+
+## Paired Session Model
+
+Pairing creates an in-memory session on the companion host:
+
+- `token`
+- current Pi `ip`
+- device `name`
+
+On each LAN scan, if the stored IP no longer accepts the token, the scanner probes discovered devices and rebinds the session automatically. `GET /api/paired` can also restore a session after companion restart by validating the token against a hint IP or discovered devices.
+
+Proxy routes for paired traffic require an active server session. Unpaired routes (`POST /proxy/confirm-pair`, reconnect via `GET /proxy/codes`) still accept a caller-provided IP.
+
 ## Health Model
 
-`GET /health` builds a structured report from live service checks for the selected MAVEN device. If an `ip` query parameter is provided, that device is checked. Otherwise, the freshest discovered device is checked.
+`GET /health` builds a structured report from live service checks for the selected MAVEN device. If an `ip` query parameter is provided, that device is checked. Otherwise, the paired session IP is used when available. If neither exists, the freshest discovered device is checked.
 
 Overall status is calculated as:
 
@@ -112,13 +128,14 @@ The endpoint returns HTTP `200` for `healthy` and `degraded`, and HTTP `503` for
 ## Important Operational Notes
 
 - Device discovery is in-memory. Restarting the companion app clears discovered devices until the next scan.
+- Paired sessions are in-memory. Restarting the companion app clears the session until the browser calls `GET /api/paired` with a valid token or the user re-pairs.
 - Running under Gunicorn with the current `Procfile` imports `app:app`, but does not execute the `if __name__ == "__main__"` block. That means the scanner does not start in that path without a lifecycle change.
 - Multiple Gunicorn workers would each have separate in-memory device state. A production deployment should use a single scanner process or shared state.
 - The scanner assumes a `/24` LAN and may not work on more complex networks without configuration.
 
 ## Security Considerations
 
-- Proxy routes currently accept a caller-provided `ip` query/body value. Production deployments should restrict proxy targets to discovered/paired device IPs.
+- Proxy routes no longer trust caller-supplied IPs for paired traffic; the server session is authoritative.
 - Tokens are stored in browser `localStorage`; this is simple but vulnerable to XSS.
 - The frontend uses dynamic HTML insertion in several places. Values from devices should be sanitized before rendering.
 - The companion app is designed for trusted local networks, not direct public internet exposure.

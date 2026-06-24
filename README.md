@@ -12,6 +12,8 @@ The current repository contains the Flask companion app and static model/debug a
 - Camera status, MJPEG video, and still-frame fallback through the local Flask proxy.
 - Microphone status and live RMS level display.
 - `/health` endpoint for deployment and local diagnostics.
+- Server-side paired sessions with automatic IP rebinding after DHCP or router changes.
+- Live connection status on the home screen driven by `/health`.
 - Mobile-first browser UI served from the Flask application.
 
 ## Repository Layout
@@ -150,6 +152,6 @@ python app.py
 ## Development Notes
 
 - The frontend is currently embedded in `app.py` with `render_template_string`.
-- The browser stores the MAVEN IP, auth token, and device name in `localStorage`.
+- The browser stores the MAVEN token and a reconnect hint IP in `localStorage`. The companion app stores the authoritative paired session in memory and rebinds the Pi IP during LAN scans.
 - The Flask server proxies browser requests to the MAVEN device so the browser does not need to call the Pi services directly.
 - See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a deeper architecture overview.

@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import unittest
+from unittest.mock import patch
 
 import app as maven_app
 
@@ -28,10 +29,14 @@ class ProductionReadinessTests(unittest.TestCase):
         maven_app.logger.handlers = [self.log_handler]
         maven_app.logger.setLevel(logging.INFO)
         maven_app.last_service_health.clear()
+        maven_app.clear_paired_session()
+        with maven_app.lock:
+            maven_app.devices.clear()
         self.client = maven_app.app.test_client()
 
     def tearDown(self):
         maven_app.logger.handlers = self.original_handlers
+        maven_app.clear_paired_session()
 
     def log_events(self):
         return [
@@ -73,9 +78,6 @@ class ProductionReadinessTests(unittest.TestCase):
         self.assertEqual(request_event["status_code"], 500)
 
     def test_health_schema_stays_stable_without_discovered_device(self):
-        with maven_app.lock:
-            maven_app.devices.clear()
-
         response = self.client.get("/health", headers={"X-Request-ID": "req-health-test"})
         body = response.get_json()
 
@@ -84,6 +86,109 @@ class ProductionReadinessTests(unittest.TestCase):
         self.assertEqual(set(body["services"]), {"camera", "microphone", "ir"})
         for service in body["services"].values():
             self.assertEqual(set(service), {"status", "latency_ms", "error"})
+
+    def test_health_prefers_paired_session_ip(self):
+        maven_app.set_paired_session("secret-token", "192.168.1.50", "Living room")
+        with patch.object(maven_app, "check_http_service") as mock_check:
+            mock_check.return_value = {
+                "name": "camera",
+                "status": "healthy",
+                "latency_ms": 1.0,
+                "error": None,
+            }
+            response = self.client.get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        for call in mock_check.call_args_list:
+            self.assertTrue(call.args[1].startswith("http://192.168.1.50:"))
+
+    def test_api_paired_returns_authoritative_ip(self):
+        maven_app.set_paired_session("secret-token", "192.168.1.50", "Living room")
+        response = self.client.get(
+            "/api/paired",
+            headers={"X-Maven-Token": "secret-token"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["ip"], "192.168.1.50")
+        self.assertEqual(body["name"], "Living room")
+
+    def test_api_paired_restores_session_from_discovered_devices(self):
+        with maven_app.lock:
+            maven_app.devices["192.168.1.77"] = {
+                "ip": "192.168.1.77",
+                "name": "Bedroom",
+                "pairing": False,
+                "seen": 1.0,
+            }
+
+        with patch.object(maven_app, "verify_device_token", side_effect=lambda token, ip: ip == "192.168.1.77"):
+            response = self.client.get(
+                "/api/paired?ip=192.168.1.1",
+                headers={"X-Maven-Token": "restored-token"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["ip"], "192.168.1.77")
+        session = maven_app.get_paired_session()
+        self.assertEqual(session["token"], "restored-token")
+        self.assertEqual(session["ip"], "192.168.1.77")
+
+    def test_rebind_updates_paired_ip_when_token_moves(self):
+        maven_app.set_paired_session("secret-token", "192.168.1.10", "MAVEN")
+
+        def verify_side_effect(token, ip):
+            return ip == "192.168.1.99"
+
+        with patch.object(maven_app, "verify_device_token", side_effect=verify_side_effect):
+            maven_app.rebind_paired_ip_if_needed([("192.168.1.99", {"ok": True})])
+
+        session = maven_app.get_paired_session()
+        self.assertEqual(session["ip"], "192.168.1.99")
+        rebound_events = [
+            event for event in self.log_events() if event["event"] == "paired_ip_rebound"
+        ]
+        self.assertEqual(len(rebound_events), 1)
+        self.assertEqual(rebound_events[0]["old_ip"], "192.168.1.10")
+        self.assertEqual(rebound_events[0]["new_ip"], "192.168.1.99")
+
+    def test_proxy_send_uses_paired_ip_not_client_query(self):
+        maven_app.set_paired_session("secret-token", "192.168.1.50", "MAVEN")
+
+        with patch.object(maven_app.req, "post") as mock_post:
+            mock_post.return_value.status_code = 200
+            mock_post.return_value.text = '{"ok": true}'
+            response = self.client.post(
+                "/proxy/send/power_toggle?ip=192.168.1.99",
+                headers={"X-Maven-Token": "secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_post.assert_called_once()
+        self.assertIn("192.168.1.50", mock_post.call_args.args[0])
+        self.assertNotIn("192.168.1.99", mock_post.call_args.args[0])
+
+    def test_proxy_send_requires_paired_session(self):
+        response = self.client.post(
+            "/proxy/send/power_toggle?ip=192.168.1.50",
+            headers={"X-Maven-Token": "secret-token"},
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(response.get_json()["ok"])
+
+    def test_disconnect_clears_paired_session(self):
+        maven_app.set_paired_session("secret-token", "192.168.1.50", "MAVEN")
+        response = self.client.post(
+            "/api/disconnect",
+            headers={"X-Maven-Token": "secret-token"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(maven_app.get_paired_session())
 
 
 if __name__ == "__main__":
