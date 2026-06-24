@@ -9,6 +9,7 @@ The Pi runs microphone_server.py on port 8082.
 """
 
 import asyncio, aiohttp, socket, threading, time, json
+from datetime import datetime, timezone
 from flask import Flask, jsonify, render_template_string, request
 
 PI_PORT    = 5000
@@ -52,6 +53,11 @@ async def scan_once(base, my_ip):
 # ── shared state ──────────────────────────────────────────────────────────────
 devices = {}
 lock    = threading.Lock()
+scanner_state = {
+    "last_scan_at": None,
+    "last_success_at": None,
+    "last_error": None,
+}
 
 def scanner_thread():
     loop = asyncio.new_event_loop()
@@ -60,19 +66,28 @@ def scanner_thread():
     print(f"  Scanning {base}.1–254 every {SCAN_EVERY}s")
     while True:
         t0 = time.time()
-        found = loop.run_until_complete(scan_once(base, my_ip))
-        now = time.time()
-        with lock:
-            for ip, d in found:
-                devices[ip] = {
-                    "ip":      ip,
-                    "name":    d.get("name", "MAVEN"),
-                    "pairing": d.get("pairing", False),
-                    "seen":    now,
-                }
-            for ip in list(devices):
-                if now - devices[ip]["seen"] > SCAN_EVERY * 2.5:
-                    del devices[ip]
+        try:
+            found = loop.run_until_complete(scan_once(base, my_ip))
+            now = time.time()
+            with lock:
+                scanner_state["last_scan_at"] = now
+                scanner_state["last_error"] = None
+                if found:
+                    scanner_state["last_success_at"] = now
+                for ip, d in found:
+                    devices[ip] = {
+                        "ip":      ip,
+                        "name":    d.get("name", "MAVEN"),
+                        "pairing": d.get("pairing", False),
+                        "seen":    now,
+                    }
+                for ip in list(devices):
+                    if now - devices[ip]["seen"] > SCAN_EVERY * 2.5:
+                        del devices[ip]
+        except Exception as e:
+            with lock:
+                scanner_state["last_scan_at"] = now
+                scanner_state["last_error"] = str(e)
         time.sleep(max(0, SCAN_EVERY - (time.time() - t0)))
 
 # ── Flask ─────────────────────────────────────────────────────────────────────
@@ -85,6 +100,114 @@ def api_devices():
 
 # proxy all Pi API calls so the browser never touches the Pi directly
 import requests as req
+
+def utc_iso(ts):
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+
+def check_http_service(name, url, timeout=2):
+    started = time.time()
+    try:
+        r = req.get(url, timeout=timeout)
+        latency_ms = round((time.time() - started) * 1000, 1)
+        payload = None
+        try:
+            payload = r.json()
+        except ValueError:
+            pass
+        ok = 200 <= r.status_code < 300 and (
+            not isinstance(payload, dict) or payload.get("ok", True) is True
+        )
+        detail = {
+            "name": name,
+            "status": "healthy" if ok else "unhealthy",
+            "http_status": r.status_code,
+            "latency_ms": latency_ms,
+        }
+        if not ok:
+            detail["error"] = (
+                payload.get("error")
+                if isinstance(payload, dict) and payload.get("error")
+                else f"unexpected HTTP {r.status_code}"
+            )
+        return detail
+    except Exception as e:
+        return {
+            "name": name,
+            "status": "unhealthy",
+            "error": str(e),
+            "latency_ms": round((time.time() - started) * 1000, 1),
+        }
+
+def build_health_report():
+    now = time.time()
+    with lock:
+        device_snapshot = [dict(d) for d in devices.values()]
+        scanner_snapshot = dict(scanner_state)
+
+    scanner_age = (
+        round(now - scanner_snapshot["last_scan_at"], 1)
+        if scanner_snapshot["last_scan_at"] else None
+    )
+    scanner_ok = (
+        scanner_snapshot["last_scan_at"] is not None
+        and scanner_age <= SCAN_EVERY * 3
+        and scanner_snapshot["last_error"] is None
+    )
+
+    device_reports = []
+    service_checks = []
+    for device in device_snapshot:
+        ip = device["ip"]
+        checks = [
+            check_http_service("maven_api", f"http://{ip}:{PI_PORT}/api/discover"),
+            check_http_service("camera", f"http://{ip}:{CAM_PORT}/status"),
+            check_http_service("microphone", f"http://{ip}:{MIC_PORT}/status"),
+        ]
+        service_checks.extend(checks)
+        device_reports.append({
+            "ip": ip,
+            "name": device.get("name", "MAVEN"),
+            "pairing": device.get("pairing", False),
+            "last_seen_at": utc_iso(device.get("seen")),
+            "services": checks,
+        })
+
+    total_services = len(service_checks)
+    healthy_services = sum(1 for svc in service_checks if svc["status"] == "healthy")
+
+    if not scanner_ok or not device_snapshot or healthy_services == 0:
+        overall = "unhealthy"
+    elif healthy_services == total_services:
+        overall = "healthy"
+    else:
+        overall = "degraded"
+
+    return {
+        "status": overall,
+        "checked_at": utc_iso(now),
+        "scanner": {
+            "status": "healthy" if scanner_ok else "unhealthy",
+            "scan_interval_seconds": SCAN_EVERY,
+            "last_scan_at": utc_iso(scanner_snapshot["last_scan_at"]),
+            "last_success_at": utc_iso(scanner_snapshot["last_success_at"]),
+            "last_error": scanner_snapshot["last_error"],
+            "age_seconds": scanner_age,
+        },
+        "summary": {
+            "devices_found": len(device_snapshot),
+            "services_checked": total_services,
+            "services_healthy": healthy_services,
+            "services_unhealthy": total_services - healthy_services,
+        },
+        "devices": device_reports,
+    }
+
+@app.route("/health")
+def health():
+    report = build_health_report()
+    return jsonify(report), 503 if report["status"] == "unhealthy" else 200
 
 @app.route("/proxy/confirm-pair", methods=["POST"])
 def proxy_pair():
