@@ -59,6 +59,8 @@ Successful discoveries are stored in the in-memory `devices` dictionary with:
 
 The scanner interval is controlled by `SCAN_EVERY`, currently `3` seconds.
 
+The scanner starts automatically when the Flask app module is imported, including under Gunicorn. Set `MAVEN_SCANNER_AUTOSTART=0` to disable autostart (for tests or custom process layouts). Use a single Gunicorn worker so discovery state and paired sessions stay in one process.
+
 ### Proxy API
 
 The browser uses Flask proxy routes instead of calling device services directly. After pairing, the companion app stores the session server-side and resolves the Pi IP from that session. The browser no longer supplies a trusted target IP for paired requests.
@@ -121,16 +123,15 @@ Overall status is calculated as:
 - `degraded`: at least one service is healthy and at least one service is unhealthy.
 - `unhealthy`: no services are healthy or no device is available to check.
 
-Each service uses a 1-second HTTP timeout. The response body contains only `status` and `services`; service keys are `camera`, `microphone`, and `ir`.
+Each service uses a 1-second HTTP timeout. The response body contains `status`, `scanner`, and `services`. Service keys are `camera`, `microphone`, and `ir`. The `scanner` block reports whether the LAN scanner thread is running and when it last found a MAVEN device.
 
-The endpoint returns HTTP `200` for `healthy` and `degraded`, and HTTP `503` for `unhealthy`.
+The endpoint returns HTTP `200` for `healthy` and `degraded`, and HTTP `503` for `unhealthy`. If the scanner is not running, overall status is `unhealthy`.
 
 ## Important Operational Notes
 
 - Device discovery is in-memory. Restarting the companion app clears discovered devices until the next scan.
 - Paired sessions are in-memory. Restarting the companion app clears the session until the browser calls `GET /api/paired` with a valid token or the user re-pairs.
-- Running under Gunicorn with the current `Procfile` imports `app:app`, but does not execute the `if __name__ == "__main__"` block. That means the scanner does not start in that path without a lifecycle change.
-- Multiple Gunicorn workers would each have separate in-memory device state. A production deployment should use a single scanner process or shared state.
+- Production deployments should run Gunicorn with a single worker (`Procfile` sets `--workers 1`) so the scanner and paired session state are not duplicated across processes.
 - The scanner assumes a `/24` LAN and may not work on more complex networks without configuration.
 
 ## Security Considerations
@@ -144,7 +145,5 @@ The endpoint returns HTTP `200` for `healthy` and `degraded`, and HTTP `503` for
 
 1. Split `app.py` into backend routes, scanner service, templates, and static assets.
 2. Move configuration to environment variables.
-3. Start the scanner through an explicit app lifecycle hook for Gunicorn deployments.
-4. Add tests for health reporting, proxy validation, and scanner state.
-5. Restrict proxy requests to known MAVEN device IPs.
-6. Add documentation or code for the Pi-side MAVEN services.
+3. Persist paired sessions across companion restarts.
+4. Add documentation or code for the Pi-side MAVEN services.

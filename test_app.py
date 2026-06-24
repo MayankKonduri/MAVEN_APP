@@ -1,8 +1,12 @@
 import io
 import json
 import logging
+import os
+import time
 import unittest
 from unittest.mock import patch
+
+os.environ["MAVEN_SCANNER_AUTOSTART"] = "0"
 
 import app as maven_app
 
@@ -32,9 +36,17 @@ class ProductionReadinessTests(unittest.TestCase):
         maven_app.clear_paired_session()
         with maven_app.lock:
             maven_app.devices.clear()
+            maven_app.scanner_state["last_scan_at"] = time.time()
+            maven_app.scanner_state["last_success_at"] = time.time()
+            maven_app.scanner_state["last_error"] = None
+        self.scanner_running_patch = patch.object(
+            maven_app, "scanner_is_running", return_value=True
+        )
+        self.scanner_running_patch.start()
         self.client = maven_app.app.test_client()
 
     def tearDown(self):
+        self.scanner_running_patch.stop()
         maven_app.logger.handlers = self.original_handlers
         maven_app.clear_paired_session()
 
@@ -82,10 +94,33 @@ class ProductionReadinessTests(unittest.TestCase):
         body = response.get_json()
 
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(set(body), {"status", "services"})
+        self.assertEqual(set(body), {"status", "services", "scanner"})
         self.assertEqual(set(body["services"]), {"camera", "microphone", "ir"})
+        self.assertEqual(
+            set(body["scanner"]),
+            {"status", "running", "last_scan_at", "last_success_at", "error"},
+        )
         for service in body["services"].values():
             self.assertEqual(set(service), {"status", "latency_ms", "error"})
+
+    def test_health_marks_unhealthy_when_scanner_not_running(self):
+        self.scanner_running_patch.stop()
+        response = self.client.get("/health")
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(body["status"], "unhealthy")
+        self.assertFalse(body["scanner"]["running"])
+        self.assertEqual(body["scanner"]["error"], "scanner not running")
+
+    def test_start_scanner_is_idempotent(self):
+        maven_app.scanner_started = False
+        with patch.object(maven_app.threading, "Thread") as mock_thread:
+            mock_thread.return_value.start = lambda: None
+            self.assertTrue(maven_app.start_scanner())
+            self.assertFalse(maven_app.start_scanner())
+            self.assertTrue(maven_app.scanner_is_running())
+            mock_thread.assert_called_once()
 
     def test_health_prefers_paired_session_ip(self):
         maven_app.set_paired_session("secret-token", "192.168.1.50", "Living room")

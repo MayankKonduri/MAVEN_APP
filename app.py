@@ -8,7 +8,7 @@ The Pi runs camera_server.py on port 8081.
 The Pi runs microphone_server.py on port 8082.
 """
 
-import asyncio, aiohttp, socket, threading, time, json
+import asyncio, aiohttp, os, socket, threading, time, json
 import logging, sys, uuid
 from datetime import datetime, timezone
 from flask import Flask, g, has_request_context, jsonify, render_template_string, request
@@ -19,6 +19,9 @@ CAM_PORT   = 8081   # camera_server.py on the Pi
 MIC_PORT   = 8082   # microphone_server.py on the Pi
 APP_PORT   = 8080
 SCAN_EVERY = 3
+SCANNER_AUTOSTART = os.environ.get("MAVEN_SCANNER_AUTOSTART", "1").strip().lower() not in (
+    "0", "false", "no",
+)
 
 # ── network scanning ──────────────────────────────────────────────────────────
 def get_subnet():
@@ -62,6 +65,8 @@ scanner_state = {
     "last_success_at": None,
     "last_error": None,
 }
+scanner_started = False
+scanner_start_lock = threading.Lock()
 
 def scanner_thread():
     loop = asyncio.new_event_loop()
@@ -117,6 +122,51 @@ def log_event(level, event, **fields):
     }
     payload.update(fields)
     logger.log(getattr(logging, level.upper()), json.dumps(payload, separators=(",", ":")))
+
+def scanner_is_running():
+    return scanner_started
+
+def start_scanner():
+    global scanner_started
+    with scanner_start_lock:
+        if scanner_started:
+            return False
+        thread = threading.Thread(target=scanner_thread, daemon=True, name="maven-scanner")
+        thread.start()
+        scanner_started = True
+        log_event("info", "scanner_started", autostart=SCANNER_AUTOSTART)
+        return True
+
+def build_scanner_report():
+    running = scanner_is_running()
+    with lock:
+        last_scan_at = scanner_state.get("last_scan_at")
+        last_success_at = scanner_state.get("last_success_at")
+        last_error = scanner_state.get("last_error")
+
+    if not running:
+        status = "unhealthy"
+        error = "scanner not running"
+    elif last_error:
+        status = "degraded"
+        error = last_error
+    elif last_scan_at is None:
+        status = "degraded"
+        error = "scanner has not completed a scan yet"
+    elif last_success_at is None:
+        status = "degraded"
+        error = "no MAVEN device discovered on LAN"
+    else:
+        status = "healthy"
+        error = None
+
+    return {
+        "status": status,
+        "running": running,
+        "last_scan_at": last_scan_at,
+        "last_success_at": last_success_at,
+        "error": error,
+    }
 
 @app.before_request
 def start_request_observation():
@@ -348,8 +398,15 @@ def build_health_report():
     else:
         overall = "unhealthy"
 
+    scanner_report = build_scanner_report()
+    if scanner_report["status"] == "unhealthy":
+        overall = "unhealthy"
+    elif scanner_report["status"] == "degraded" and overall == "healthy":
+        overall = "degraded"
+
     return {
         "status": overall,
+        "scanner": scanner_report,
         "services": {
             svc["name"]: {
                 "status": svc["status"],
@@ -1498,6 +1555,9 @@ function stopCameraFeed() {
 </body>
 </html>"""
 
+if SCANNER_AUTOSTART:
+    start_scanner()
+
 if __name__ == "__main__":
     try:
         import requests
@@ -1512,8 +1572,7 @@ if __name__ == "__main__":
         subprocess.check_call([sys.executable,"-m","pip","install","aiohttp","-q"])
         import aiohttp
 
-    t = threading.Thread(target=scanner_thread, daemon=True)
-    t.start()
+    start_scanner()
     print("\n=== MAVEN Companion ===")
     print(f"Open in browser:  http://localhost:{APP_PORT}")
     print(f"Or on your phone: http://<this-computer-IP>:{APP_PORT}\n")

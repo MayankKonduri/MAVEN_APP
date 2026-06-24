@@ -93,6 +93,7 @@ GET /health
 The response includes:
 
 - Overall status: `healthy`, `degraded`, or `unhealthy`.
+- Scanner status: whether the LAN scanner thread is running and when it last succeeded.
 - Service checks for `camera`, `microphone`, and `ir`.
 - Each service status, latency in milliseconds, and nullable error.
 
@@ -101,6 +102,13 @@ Example:
 ```json
 {
   "status": "degraded",
+  "scanner": {
+    "status": "healthy",
+    "running": true,
+    "last_scan_at": 1710000000.0,
+    "last_success_at": 1710000000.0,
+    "error": null
+  },
   "services": {
     "camera": {
       "status": "healthy",
@@ -121,7 +129,7 @@ Example:
 }
 ```
 
-Each service check uses a 1-second timeout. `healthy` means all three services are healthy, `degraded` means at least one service is healthy and at least one is unhealthy, and `unhealthy` means no services are healthy or no target device is available.
+Each service check uses a 1-second timeout. `healthy` means all three services are healthy, `degraded` means at least one service is healthy and at least one is unhealthy, and `unhealthy` means no services are healthy, no target device is available, or the LAN scanner is not running.
 
 The endpoint returns HTTP `200` for `healthy` or `degraded`, and HTTP `503` for `unhealthy`.
 
@@ -130,12 +138,12 @@ The endpoint returns HTTP `200` for `healthy` or `degraded`, and HTTP `503` for 
 The included `Procfile` defines:
 
 ```text
-web: gunicorn app:app
+web: gunicorn --workers 1 --bind 0.0.0.0:${PORT:-8080} app:app
 ```
 
-That is suitable for platforms that run Gunicorn, but note that the current LAN scanner is started inside the `if __name__ == "__main__"` block when running `python app.py`. If deploying through Gunicorn, move scanner startup into the process lifecycle before relying on `/api/devices` or `/health` for discovery.
+Gunicorn imports `app:app`, which autostarts the LAN scanner in the same process. Use a single worker so discovery and paired-session state are not split across processes. Set `MAVEN_SCANNER_AUTOSTART=0` only for tests or custom layouts.
 
-For local development and hardware testing, prefer:
+For local development and hardware testing:
 
 ```powershell
 python app.py
@@ -147,7 +155,7 @@ python app.py
 - Pairing fails: hold the hardware button for 5 seconds, then retry while the device is in pairing mode.
 - Camera unavailable: confirm the camera service is reachable at `http://<device-ip>:8081/status`.
 - Microphone unavailable: confirm the microphone service is reachable at `http://<device-ip>:8082/status`.
-- `/health` is unhealthy after starting with Gunicorn: use `python app.py` locally or update scanner startup for the deployment path.
+- `/health` reports `scanner.running: false`: confirm Gunicorn is using one worker and `MAVEN_SCANNER_AUTOSTART` is not disabled.
 
 ## Development Notes
 
