@@ -9,8 +9,10 @@ The Pi runs microphone_server.py on port 8082.
 """
 
 import asyncio, aiohttp, socket, threading, time, json
+import logging, sys, uuid
 from datetime import datetime, timezone
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, g, has_request_context, jsonify, render_template_string, request
+from werkzeug.exceptions import HTTPException
 
 PI_PORT    = 5000
 CAM_PORT   = 8081   # camera_server.py on the Pi
@@ -53,6 +55,8 @@ async def scan_once(base, my_ip):
 # ── shared state ──────────────────────────────────────────────────────────────
 devices = {}
 lock    = threading.Lock()
+health_lock = threading.Lock()
+last_service_health = {}
 scanner_state = {
     "last_scan_at": None,
     "last_success_at": None,
@@ -93,6 +97,65 @@ def scanner_thread():
 # ── Flask ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
+logger = logging.getLogger("maven")
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+def utc_timestamp():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+def log_event(level, event, **fields):
+    payload = {
+        "timestamp": utc_timestamp(),
+        "level": level.upper(),
+        "event": event,
+    }
+    payload.update(fields)
+    logger.log(getattr(logging, level.upper()), json.dumps(payload, separators=(",", ":")))
+
+@app.before_request
+def start_request_observation():
+    g.request_started_at = time.perf_counter()
+    g.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+
+@app.after_request
+def log_request_observation(response):
+    latency_ms = round((time.perf_counter() - g.request_started_at) * 1000, 1)
+    response.headers["X-Request-ID"] = g.request_id
+    log_event(
+        "info",
+        "request_complete",
+        request_id=g.request_id,
+        method=request.method,
+        path=request.path,
+        endpoint=request.endpoint,
+        status_code=response.status_code,
+        latency_ms=latency_ms,
+        remote_addr=request.headers.get("X-Forwarded-For", request.remote_addr),
+    )
+    return response
+
+@app.errorhandler(Exception)
+def log_unhandled_exception(error):
+    if isinstance(error, HTTPException):
+        return error
+
+    log_event(
+        "error",
+        "request_exception",
+        request_id=getattr(g, "request_id", None),
+        method=request.method,
+        path=request.path,
+        endpoint=request.endpoint,
+        exception_type=type(error).__name__,
+        exception_message=str(error),
+    )
+    return jsonify({"error": "internal server error"}), 500
+
 @app.route("/api/devices")
 def api_devices():
     with lock:
@@ -101,12 +164,9 @@ def api_devices():
 # proxy all Pi API calls so the browser never touches the Pi directly
 import requests as req
 
-def utc_iso(ts):
-    if ts is None:
-        return None
-    return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+HEALTH_TIMEOUT_SECONDS = 1.0
 
-def check_http_service(name, url, timeout=2):
+def check_http_service(name, url, timeout=HEALTH_TIMEOUT_SECONDS):
     started = time.time()
     try:
         r = req.get(url, timeout=timeout)
@@ -122,8 +182,8 @@ def check_http_service(name, url, timeout=2):
         detail = {
             "name": name,
             "status": "healthy" if ok else "unhealthy",
-            "http_status": r.status_code,
             "latency_ms": latency_ms,
+            "error": None,
         }
         if not ok:
             detail["error"] = (
@@ -140,68 +200,75 @@ def check_http_service(name, url, timeout=2):
             "latency_ms": round((time.time() - started) * 1000, 1),
         }
 
-def build_health_report():
-    now = time.time()
+def select_health_target_ip():
+    requested_ip = request.args.get("ip")
+    if requested_ip:
+        return requested_ip
+
     with lock:
-        device_snapshot = [dict(d) for d in devices.values()]
-        scanner_snapshot = dict(scanner_state)
+        if not devices:
+            return None
+        return max(devices.values(), key=lambda d: d.get("seen", 0)).get("ip")
 
-    scanner_age = (
-        round(now - scanner_snapshot["last_scan_at"], 1)
-        if scanner_snapshot["last_scan_at"] else None
-    )
-    scanner_ok = (
-        scanner_snapshot["last_scan_at"] is not None
-        and scanner_age <= SCAN_EVERY * 3
-        and scanner_snapshot["last_error"] is None
-    )
+def log_service_health_transitions(checks):
+    request_id = getattr(g, "request_id", None) if has_request_context() else None
+    with health_lock:
+        for check in checks:
+            service = check["name"]
+            current_status = check["status"]
+            previous_status = last_service_health.get(service)
+            last_service_health[service] = current_status
+            if previous_status is None or previous_status == current_status:
+                continue
+            log_event(
+                "warning",
+                "service_health_transition",
+                request_id=request_id,
+                service=service,
+                previous_status=previous_status,
+                current_status=current_status,
+                error=check.get("error"),
+            )
 
-    device_reports = []
-    service_checks = []
-    for device in device_snapshot:
-        ip = device["ip"]
+def build_health_report():
+    ip = select_health_target_ip()
+    if ip:
         checks = [
-            check_http_service("maven_api", f"http://{ip}:{PI_PORT}/api/discover"),
             check_http_service("camera", f"http://{ip}:{CAM_PORT}/status"),
             check_http_service("microphone", f"http://{ip}:{MIC_PORT}/status"),
+            check_http_service("ir", f"http://{ip}:{PI_PORT}/api/discover"),
         ]
-        service_checks.extend(checks)
-        device_reports.append({
-            "ip": ip,
-            "name": device.get("name", "MAVEN"),
-            "pairing": device.get("pairing", False),
-            "last_seen_at": utc_iso(device.get("seen")),
-            "services": checks,
-        })
-
-    total_services = len(service_checks)
-    healthy_services = sum(1 for svc in service_checks if svc["status"] == "healthy")
-
-    if not scanner_ok or not device_snapshot or healthy_services == 0:
-        overall = "unhealthy"
-    elif healthy_services == total_services:
-        overall = "healthy"
     else:
+        checks = [
+            {
+                "name": name,
+                "status": "unhealthy",
+                "latency_ms": 0.0,
+                "error": "no device discovered",
+            }
+            for name in ("camera", "microphone", "ir")
+        ]
+
+    log_service_health_transitions(checks)
+    healthy_services = sum(1 for svc in checks if svc["status"] == "healthy")
+
+    if healthy_services == len(checks):
+        overall = "healthy"
+    elif healthy_services > 0:
         overall = "degraded"
+    else:
+        overall = "unhealthy"
 
     return {
         "status": overall,
-        "checked_at": utc_iso(now),
-        "scanner": {
-            "status": "healthy" if scanner_ok else "unhealthy",
-            "scan_interval_seconds": SCAN_EVERY,
-            "last_scan_at": utc_iso(scanner_snapshot["last_scan_at"]),
-            "last_success_at": utc_iso(scanner_snapshot["last_success_at"]),
-            "last_error": scanner_snapshot["last_error"],
-            "age_seconds": scanner_age,
+        "services": {
+            svc["name"]: {
+                "status": svc["status"],
+                "latency_ms": svc["latency_ms"],
+                "error": svc["error"],
+            }
+            for svc in checks
         },
-        "summary": {
-            "devices_found": len(device_snapshot),
-            "services_checked": total_services,
-            "services_healthy": healthy_services,
-            "services_unhealthy": total_services - healthy_services,
-        },
-        "devices": device_reports,
     }
 
 @app.route("/health")

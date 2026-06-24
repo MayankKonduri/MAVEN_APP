@@ -91,23 +91,35 @@ GET /health
 The response includes:
 
 - Overall status: `healthy`, `degraded`, or `unhealthy`.
-- Scanner freshness and last error.
-- Number of discovered devices.
-- Per-device checks for MAVEN API, camera, and microphone services.
+- Service checks for `camera`, `microphone`, and `ir`.
+- Each service status, latency in milliseconds, and nullable error.
 
 Example:
 
 ```json
 {
   "status": "degraded",
-  "summary": {
-    "devices_found": 1,
-    "services_checked": 3,
-    "services_healthy": 2,
-    "services_unhealthy": 1
+  "services": {
+    "camera": {
+      "status": "healthy",
+      "latency_ms": 12.3,
+      "error": null
+    },
+    "microphone": {
+      "status": "unhealthy",
+      "latency_ms": 1001.8,
+      "error": "HTTPConnectionPool timeout"
+    },
+    "ir": {
+      "status": "healthy",
+      "latency_ms": 9.4,
+      "error": null
+    }
   }
 }
 ```
+
+Each service check uses a 1-second timeout. `healthy` means all three services are healthy, `degraded` means at least one service is healthy and at least one is unhealthy, and `unhealthy` means no services are healthy or no target device is available.
 
 The endpoint returns HTTP `200` for `healthy` or `degraded`, and HTTP `503` for `unhealthy`.
 

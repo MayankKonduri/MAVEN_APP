@@ -97,13 +97,15 @@ Persistent browser state is stored in `localStorage`:
 
 ## Health Model
 
-`GET /health` builds a structured report from scanner state and live device service checks.
+`GET /health` builds a structured report from live service checks for the selected MAVEN device. If an `ip` query parameter is provided, that device is checked. Otherwise, the freshest discovered device is checked.
 
 Overall status is calculated as:
 
-- `healthy`: scanner is fresh, at least one device is discovered, and all checked services are healthy.
-- `degraded`: scanner is fresh, at least one device is discovered, and some services are healthy while others are unhealthy.
-- `unhealthy`: scanner is stale or not running, no devices are discovered, or no checked services are healthy.
+- `healthy`: camera, microphone, and IR checks are all healthy.
+- `degraded`: at least one service is healthy and at least one service is unhealthy.
+- `unhealthy`: no services are healthy or no device is available to check.
+
+Each service uses a 1-second HTTP timeout. The response body contains only `status` and `services`; service keys are `camera`, `microphone`, and `ir`.
 
 The endpoint returns HTTP `200` for `healthy` and `degraded`, and HTTP `503` for `unhealthy`.
 
