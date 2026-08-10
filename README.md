@@ -112,8 +112,10 @@ MAVEN has two runtime sides: the **companion host** (your laptop or a local serv
 │   ├── yolov8n.onnx
 │   ├── hand_yolov8n.onnx
 │   └── handpose_estimation.onnx
-├── debug_camera_assistant.jpg      # camera/debug reference images
-├── debug_camera_assistant_stable.jpg
+├── assets/
+│   └── debug/                      # camera/debug reference images (unreferenced by app)
+│       ├── debug_camera_assistant.jpg
+│       └── debug_camera_assistant_stable.jpg
 └── docs/
     └── ARCHITECTURE.md             # runtime architecture and operational notes
 ```
