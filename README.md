@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/aiohttp-LAN_Scanner-2C5BB4?style=for-the-badge&logo=aiohttp&logoColor=white" alt="aiohttp" />
   <img src="https://img.shields.io/badge/Gunicorn-Deploy-499848?style=for-the-badge&logo=gunicorn&logoColor=white" alt="Gunicorn" />
 </p>
-
+ 
 <p>
   <img src="https://img.shields.io/badge/discovery-254_hosts_%2F_3s-blue?style=flat-square" alt="Discovery" />
   <img src="https://img.shields.io/badge/UI-mobile_first-ff69b4?style=flat-square" alt="Mobile" />
